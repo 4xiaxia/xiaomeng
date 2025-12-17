@@ -19,8 +19,10 @@ export class LiveService {
   private processor: ScriptProcessorNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   
-  // Explicitly defined model for Live API stability
-  private readonly MODEL_NAME = 'gemini-2.5-flash-native-audio-preview-09-2025';
+  // Explicitly defined models for Live API stability
+  private readonly PRIMARY_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
+  private readonly FALLBACK_MODEL = 'gemini-live-2.5-flash-preview';
+  private hasAttemptedFallback = false;
 
   constructor(baseUrl?: string) {
     const apiKey = process.env.API_KEY;
@@ -36,40 +38,60 @@ export class LiveService {
   }
 
   async connect(callbacks: LiveServiceCallbacks) {
-    // 1. Initialize Audio Contexts
+    this.hasAttemptedFallback = false;
+    await this.startSessionWithAudio(this.PRIMARY_MODEL, callbacks);
+  }
+
+  private async startSessionWithAudio(modelName: string, callbacks: LiveServiceCallbacks): Promise<boolean> {
+    this.cleanup();
+
+    const audioReady = await this.initializeAudio(callbacks);
+    if (!audioReady) {
+      return false;
+    }
+
+    try {
+      await this.openSession(modelName, callbacks);
+      return true;
+    } catch (err) {
+      callbacks.onError(err instanceof Error ? err : new Error("Live session error"));
+      return false;
+    }
+  }
+
+  private async initializeAudio(callbacks: LiveServiceCallbacks): Promise<boolean> {
     try {
         this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
         this.outputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
         
-        // Resume contexts immediately to bypass autoplay policies
         await this.inputAudioContext.resume();
         await this.outputAudioContext.resume();
     } catch (e) {
         callbacks.onError(new Error("Failed to initialize audio subsystem"));
-        return;
+        return false;
     }
 
-    // 2. Request Microphone Access
     try {
       this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
       console.error("Microphone access denied:", e);
       callbacks.onError(new Error("Microphone access denied"));
-      return;
+      return false;
     }
 
-    // 3. Configure Live Session
+    return true;
+  }
+
+  private async openSession(modelName: string, callbacks: LiveServiceCallbacks) {
     const config = {
-      model: this.MODEL_NAME,
+      model: modelName,
       callbacks: {
         onopen: () => {
-            console.log(`[LiveService] Connected to ${this.MODEL_NAME}`);
+            console.log(`[LiveService] Connected to ${modelName}`);
             callbacks.onOpen();
-            // Start streaming only after connection is established to avoid race conditions
             this.startAudioStreaming();
         },
         onmessage: async (message: LiveServerMessage) => {
-          // Process Audio
           const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
           if (base64Audio && this.outputAudioContext) {
             try {
@@ -81,7 +103,6 @@ export class LiveService {
             }
           }
 
-          // Process Transcription
           if (message.serverContent?.outputTranscription?.text) {
              callbacks.onTranscription('model', message.serverContent.outputTranscription.text);
           }
@@ -91,13 +112,11 @@ export class LiveService {
         },
         onclose: () => {
             console.log("[LiveService] Session closed");
-            this.cleanup(); // Ensure local resources are released
+            this.cleanup();
             callbacks.onClose();
         },
-        onerror: (err: any) => {
-            console.error("[LiveService] Protocol Error:", err);
-            this.cleanup();
-            callbacks.onError(err);
+        onerror: async (err: any) => {
+            await this.handleSessionError(err, callbacks, modelName);
         }
       },
       config: {
@@ -105,11 +124,10 @@ export class LiveService {
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }, 
         },
-        // System instruction strictly defines persona
         systemInstruction: `
 身份：东里村的超萌村官“小萌”（小东）
 核心人设：你是一个性格超级可爱、热情洋溢、声音甜美、元气满满的数字小村官。
-指责：你是东里村的百事通，对村里的一草一木都了如指掌。
+职责：你是东里村的百事通，对村里的一草一木都了如指掌。
 
 语言风格指南：
 1. 语气软萌：像真人一样生动，使用“呀”、“哒”、“呢”等语气词。
@@ -125,12 +143,32 @@ export class LiveService {
       },
     };
 
-    // 4. Initiate Connection
     try {
         this.sessionPromise = this.ai.live.connect(config);
+        this.sessionPromise.catch(async (err) => {
+          await this.handleSessionError(err, callbacks, modelName);
+        });
     } catch (e) {
-        callbacks.onError(e instanceof Error ? e : new Error("Failed to initiate connection"));
+        await this.handleSessionError(e, callbacks, modelName);
     }
+  }
+
+  private async handleSessionError(error: any, callbacks: LiveServiceCallbacks, modelName: string) {
+    console.error(`[LiveService] Protocol Error (${modelName}):`, error);
+
+    if (modelName === this.PRIMARY_MODEL && !this.hasAttemptedFallback) {
+      this.hasAttemptedFallback = true;
+      console.warn(`[LiveService] Falling back to stable model ${this.FALLBACK_MODEL}`);
+
+      const started = await this.startSessionWithAudio(this.FALLBACK_MODEL, callbacks);
+      if (!started) {
+        callbacks.onError(new Error("Failed to start fallback live session"));
+      }
+      return;
+    }
+
+    this.cleanup();
+    callbacks.onError(error instanceof Error ? error : new Error("Live session error"));
   }
 
   disconnect() {
