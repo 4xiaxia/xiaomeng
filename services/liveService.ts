@@ -39,12 +39,24 @@ export class LiveService {
 
   async connect(callbacks: LiveServiceCallbacks) {
     this.hasAttemptedFallback = false;
+    await this.startSessionWithAudio(this.PRIMARY_MODEL, callbacks);
+  }
+
+  private async startSessionWithAudio(modelName: string, callbacks: LiveServiceCallbacks): Promise<boolean> {
     this.cleanup();
 
     const audioReady = await this.initializeAudio(callbacks);
-    if (!audioReady) return;
+    if (!audioReady) {
+      return false;
+    }
 
-    await this.openSession(this.PRIMARY_MODEL, callbacks);
+    try {
+      await this.openSession(modelName, callbacks);
+      return true;
+    } catch (err) {
+      callbacks.onError(err instanceof Error ? err : new Error("Live session error"));
+      return false;
+    }
   }
 
   private async initializeAudio(callbacks: LiveServiceCallbacks): Promise<boolean> {
@@ -115,7 +127,7 @@ export class LiveService {
         systemInstruction: `
 身份：东里村的超萌村官“小萌”（小东）
 核心人设：你是一个性格超级可爱、热情洋溢、声音甜美、元气满满的数字小村官。
-指责：你是东里村的百事通，对村里的一草一木都了如指掌。
+职责：你是东里村的百事通，对村里的一草一木都了如指掌。
 
 语言风格指南：
 1. 语气软萌：像真人一样生动，使用“呀”、“哒”、“呢”等语气词。
@@ -143,26 +155,19 @@ export class LiveService {
 
   private async handleSessionError(error: any, callbacks: LiveServiceCallbacks, modelName: string) {
     console.error(`[LiveService] Protocol Error (${modelName}):`, error);
-    this.cleanup();
 
     if (modelName === this.PRIMARY_MODEL && !this.hasAttemptedFallback) {
       this.hasAttemptedFallback = true;
       console.warn(`[LiveService] Falling back to stable model ${this.FALLBACK_MODEL}`);
 
-      const audioReady = await this.initializeAudio(callbacks);
-      if (!audioReady) {
-        callbacks.onError(new Error("Failed to initialize audio for fallback connection"));
-        return;
-      }
-
-      try {
-        await this.openSession(this.FALLBACK_MODEL, callbacks);
-      } catch (fallbackError) {
-        callbacks.onError(fallbackError instanceof Error ? fallbackError : new Error("Fallback live session failed"));
+      const started = await this.startSessionWithAudio(this.FALLBACK_MODEL, callbacks);
+      if (!started) {
+        callbacks.onError(new Error("Failed to start fallback live session"));
       }
       return;
     }
 
+    this.cleanup();
     callbacks.onError(error instanceof Error ? error : new Error("Live session error"));
   }
 
