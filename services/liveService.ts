@@ -150,9 +150,16 @@ export class LiveService {
       console.warn(`[LiveService] Falling back to stable model ${this.FALLBACK_MODEL}`);
 
       const audioReady = await this.initializeAudio(callbacks);
-      if (!audioReady) return;
+      if (!audioReady) {
+        callbacks.onError(new Error("Failed to initialize audio for fallback connection"));
+        return;
+      }
 
-      await this.openSession(this.FALLBACK_MODEL, callbacks);
+      try {
+        await this.openSession(this.FALLBACK_MODEL, callbacks);
+      } catch (fallbackError) {
+        callbacks.onError(fallbackError instanceof Error ? fallbackError : new Error("Fallback live session failed"));
+      }
       return;
     }
 
